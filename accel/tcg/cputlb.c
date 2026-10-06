@@ -1022,8 +1022,9 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
  * Called from TCG-generated code, which is under an RCU read-side
  * critical section.
  */
-void tlb_set_page_full(CPUState *cpu, int mmu_idx,
-                       vaddr addr, CPUTLBEntryFull *full)
+static void tlb_set_page_full_access(CPUState *cpu, int mmu_idx,
+                                     vaddr addr, CPUTLBEntryFull *full,
+                                     IOMMUAccessFlags access)
 {
     CPUTLB *tlb = &cpu->neg.tlb;
     CPUTLBDesc *desc = &tlb->d[mmu_idx];
@@ -1050,7 +1051,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     prot = full->prot;
     asidx = cpu_asidx_from_attrs(cpu, full->attrs);
     section = address_space_translate_for_iotlb(cpu, asidx, paddr_page,
-                                                &xlat, &sz, full->attrs, &prot);
+                                                &xlat, &sz, full->attrs, &prot,
+                                                access,
+                                                full->phys_addr - paddr_page);
     assert(sz >= TARGET_PAGE_SIZE);
 
     tlb_debug("vaddr=%016" VADDR_PRIx " paddr=0x" HWADDR_FMT_plx
@@ -1184,6 +1187,12 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     qemu_spin_unlock(&tlb->c.lock);
 }
 
+void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+                       vaddr addr, CPUTLBEntryFull *full)
+{
+    tlb_set_page_full_access(cpu, mmu_idx, addr, full, IOMMU_NONE);
+}
+
 void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
                              hwaddr paddr, MemTxAttrs attrs, int prot,
                              int mmu_idx, vaddr size)
@@ -1246,7 +1255,10 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
-            tlb_set_page_full(cpu, mmu_idx, addr, &full);
+            IOMMUAccessFlags access = type == MMU_INST_FETCH ? IOMMU_EXEC :
+                                      type == MMU_DATA_STORE ? IOMMU_WO : IOMMU_RO;
+
+            tlb_set_page_full_access(cpu, mmu_idx, addr, &full, access);
             return true;
         }
     } else {

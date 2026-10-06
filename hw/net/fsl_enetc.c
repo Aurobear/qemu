@@ -1,0 +1,856 @@
+/*
+ * NXP ENETC v4 (NETC) Ethernet PF - PCI endpoint function
+ *
+ * Models the i.MX 95 ENETC station-interface PF (PCI 1131:e101) on the NETC
+ * integrated ECAM bus: the BAR0 register file, the station-interface command
+ * BD ring (CBDR) auto-complete, and the TX/RX BD-ring DMA engine, enough to
+ * bring up Linux's enetc4_pf driver over a QEMU -netdev backend.
+ *
+ * Reset values and register layout are taken from the linux-imx enetc driver
+ * (drivers/net/ethernet/freescale/enetc) and imx95.dtsi. See
+ * docs/reviews/netc-spec.md for the bring-up rationale.
+ *
+ * Copyright (c) 2026 Kyle Fox
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "hw/net/fsl_enetc.h"
+#include "hw/pci/pci.h"
+#include "migration/vmstate.h"
+#include "net/eth.h"
+#include "net/checksum.h"
+#include "hw/misc/dma-account.h"
+
+/* --- BAR0 sub-block bases --- */
+#define ENETC_SI_BASE       0x00000
+#define ENETC_BDR_BASE      0x08000
+#define ENETC_PORT_BASE     0x10000
+#define ENETC_GLOBAL_BASE   0x20000
+
+/* --- Station interface (SI) --- */
+#define ENETC_SIMR          0x0000      /* mode (EN BIT31) */
+#define ENETC_SIPCAPR0      0x0020      /* capabilities (RSS/RFS/...) -> 0 */
+#define ENETC_SICAR0        0x0040
+#define ENETC_SIPMAR0       0x0080      /* primary MAC low */
+#define ENETC_SIPMAR1       0x0084      /* primary MAC high */
+#define ENETC_SICAPR0       0x0900      /* ring count caps -> 1 RX/1 TX */
+#define ENETC_ECAPR2        0x0008      /* PORT: [25:16]=#RX, [9:0]=#TX BDR */
+#define ENETC_SITXIDR       0x0a18      /* TX ring IRQ status (W1C) */
+#define ENETC_SIRXIDR       0x0a28      /* RX ring IRQ status (W1C) */
+#define ENETC_SIMSITRV(n)   (0x0b00 + (n) * 4)
+#define ENETC_SIMSIRRV(n)   (0x0b80 + (n) * 4)
+
+/* SI command BD ring (CBDR) */
+#define ENETC_SICBDRMR      0x0800      /* mode (EN BIT31) */
+#define ENETC_SICBDRSR      0x0804      /* status (RO) */
+#define ENETC_SICBDRBAR0    0x0810      /* ring base low */
+#define ENETC_SICBDRBAR1    0x0814      /* ring base high */
+#define ENETC_SICBDRPIR     0x0818      /* producer idx (driver writes) */
+#define ENETC_SICBDRCIR     0x081c      /* consumer idx (HW advances) */
+#define ENETC_SICBDRLENR    0x0820      /* ring length */
+
+/* --- BD rings (relative to ENETC_BDR_BASE) --- */
+#define ENETC_BDR(t, i)     ((t) * 0x100 + (i) * 0x200)
+#define ENETC_BDR_TX        0
+#define ENETC_BDR_RX        1
+#define ENETC_TBMR          0x00        /* TX mode (EN BIT31, FWB BIT24) */
+#define ENETC_TBSR          0x04        /* TX status (BUSY BIT0) */
+#define ENETC_TBBAR0        0x10
+#define ENETC_TBBAR1        0x14
+#define ENETC_TBPIR         0x18        /* TX producer (kick) */
+#define ENETC_TBCIR         0x1c        /* TX consumer (HW advances) */
+#define ENETC_TBLENR        0x20
+#define ENETC_TBIER         0xa0
+#define ENETC_TBIDR         0xa4
+#define ENETC_RBMR          0x00        /* RX mode (EN BIT31) */
+#define ENETC_RBSR          0x04        /* RX status (BUSY BIT0) */
+#define ENETC_RBBSR         0x08        /* RX buffer size */
+#define ENETC_RBCIR         0x0c        /* RX consumer (driver writes) */
+#define ENETC_RBBAR0        0x10
+#define ENETC_RBBAR1        0x14
+#define ENETC_RBPIR         0x18        /* RX producer (HW advances) */
+#define ENETC_RBLENR        0x20
+#define ENETC_RBIER         0xa0
+#define ENETC_RBIDR         0xa4
+
+/* --- Port block --- */
+#define ENETC_PMR           0x0010
+#define ENETC_PSIPMAR0(a)   ((a) * 0x80 + 0x2000)  /* per-SI primary MAC lo */
+#define ENETC_PSIPMAR1(a)   ((a) * 0x80 + 0x2004)  /* per-SI primary MAC hi */
+#define ENETC_PCR           0x4010
+#define ENETC_POR           0x4100
+#define ENETC_IMDIO_BASE    0x5030      /* internal MDIO */
+#define ENETC_MDIO_CFG      0x00        /* BSY BIT0 */
+#define ENETC_MDIO_CTL      0x04
+#define ENETC_MDIO_DATA     0x08
+#define ENETC_MDIO_ADDR     0x0c
+#define ENETC_MDIO_CTL_READ (1u << 15)
+
+/* xPCS (internal imdio MDIO addr 0) PCS-status regs pcs_get_state reads. */
+#define ENETC_MDIO_MMD_PCS                3
+#define ENETC_MDIO_STAT1                  0x0001
+#define ENETC_MDIO_STAT1_LSTATUS          0x0004
+#define ENETC_MDIO_PCS_10GBRT_STAT1       0x0020
+#define ENETC_MDIO_PCS_10GBRT_STAT1_BLKLK 0x0001
+
+/* SI per-ring MSI-X vector tables (which MSI-X entry a ring fires). */
+#define ENETC_SIMSITRV(n)   (0x0b00 + (n) * 4)  /* TX ring n -> vector */
+#define ENETC_SIMSIRRV(n)   (0x0b80 + (n) * 4)  /* RX ring n -> vector */
+
+/* TX/RX BD ring index-register masks (indices, not byte offsets). */
+#define ENETC_TBCIR_IDX_MASK 0xffff
+#define ENETC_RBCIR_IDX_MASK 0xffff
+
+/* --- Global block --- */
+#define ENETC_G_EIPBRR0     0x0bf8      /* IP block rev: low16 = 0x0401 */
+
+/*
+ * Buffer descriptors are 16 bytes. The TX BD the driver posts is
+ *   addr[8] buf_len[2] frm_len[2] lstatus[4]   (flags in lstatus[31:24]).
+ * The RX BD is posted as { addr[8], resv[8] }; HW writes it back in the
+ * union enetc_rx_bd.r layout, where buf_len is a __le16 at offset 8 and
+ * lstatus a __le32 at offset 12. The driver treats lstatus != 0 as "BD
+ * ready" and chains buffers until the BD with LSTATUS_F (final).
+ */
+#define ENETC_BD_SIZE        16
+#define ENETC_TXBD_FLAGS_F   (1u << 7)   /* final BD of a frame */
+#define ENETC_TXBD_FLAGS_OFF 24          /* flags live in lstatus[31:24] */
+#define ENETC_TXBD_FLAGS_L4CS (1u << 0)  /* insert the L4 checksum */
+#define ENETC_TXBD_IPCS      (1u << 7)   /* lstatus[7]: also insert IPv4 csum */
+#define ENETC_RXBD_INET_CSUM_OFF 0       /* RX writeback: inet_csum __le16 */
+#define ENETC_L2_HLEN          14         /* Ethernet MAC header (no VLAN) */
+#define ENETC_RXBD_BUFLEN_OFF 8          /* RX writeback: buf_len __le16 */
+#define ENETC_RXBD_LSTATUS_OFF 12        /* RX writeback: lstatus __le32 */
+#define ENETC_RXBD_LSTATUS_R (1u << 30)  /* RX writeback: BD holds a frame */
+#define ENETC_RXBD_LSTATUS_F (1u << 31)  /* RX writeback: final BD of a frame */
+
+/*
+ * Largest frame we gather (TX) or scatter (RX). Generous enough for jumbo
+ * frames; RX splits into RBBSR-sized chunks across successive posted BDs.
+ */
+#define ENETC_FRAME_MAX      16384
+
+/* Reset / fixed values */
+#define ENETC_REV_4_1       0x0401
+#define ENETC_SICAPR0_VAL   0x00010001  /* [31:16]=1 RX ring, [7:0]=1 TX ring */
+
+#define ENETC_MR_EN         (1u << 31)
+
+static inline uint32_t enetc_reg(FslEnetcState *s, hwaddr off)
+{
+    return s->regs[off / 4];
+}
+
+static inline void enetc_set(FslEnetcState *s, hwaddr off, uint32_t val)
+{
+    s->regs[off / 4] = val;
+}
+
+/*
+ * CBDR auto-complete. The driver posts NTMP command BDs and polls
+ * SICBDRCIR until it reaches SICBDRPIR. We never stall: snap the consumer
+ * index to the producer index so every command "completes" immediately.
+ * (Per-command response payloads are left zeroed = success; extend here if
+ * a command's read-back is needed.)
+ */
+static void enetc_cbdr_kick(FslEnetcState *s)
+{
+    enetc_set(s, ENETC_SI_BASE + ENETC_SICBDRCIR,
+              enetc_reg(s, ENETC_SI_BASE + ENETC_SICBDRPIR));
+}
+
+/* Raise the MSI-X vector a ring is routed to (SIMSITRV/SIMSIRRV entry). */
+static void enetc_ring_irq(FslEnetcState *s, hwaddr msivec_reg)
+{
+    PCIDevice *pci = PCI_DEVICE(s);
+    uint32_t vec = enetc_reg(s, ENETC_SI_BASE + msivec_reg);
+
+    if (msix_enabled(pci)) {
+        msix_notify(pci, vec);
+    }
+}
+
+/* Base GPA of a BD ring from its BDxBAR0/BDxBAR1 register pair. */
+static uint64_t enetc_ring_base(FslEnetcState *s, hwaddr bar0_off)
+{
+    return enetc_reg(s, bar0_off) |
+           ((uint64_t)enetc_reg(s, bar0_off + 4) << 32);
+}
+
+/*
+ * TX kick. The driver writes its producer index to TBPIR; walk the BD ring
+ * from the consumer index (TBCIR) up to it, transmit each frame, then snap
+ * TBCIR to TBPIR and raise the ring's TX interrupt. BDs are 16 bytes and the
+ * ring length (in BDs) is TBLENR. Multi-BD frames are gathered until the F
+ * (final) flag.
+ */
+/*
+ * TX checksum offload. When the skb is CHECKSUM_PARTIAL the driver does NOT
+ * checksum in software - it sets TXBD FLAGS_L4CS (and ipcs for IPv4) and
+ * leaves only the pseudo-header sum in the L4 checksum field, expecting the
+ * MAC to finish the job. A model that transmits the frame untouched therefore
+ * puts a wrong L4 checksum on the wire, and the peer silently drops every
+ * segment (Linux counts them in TcpExt InCsumErrors, nothing is logged). ICMP
+ * still works because the kernel checksums it in software, which is exactly
+ * why this looked like "the link is up but TCP is dead".
+ *
+ * enetc4 only takes this path when checksum offload is active, which the
+ * driver enables for revision 4 - the revision we report.
+ *
+ * net_checksum_calculate() understands Ethernet/VLAN + IPv4 TCP/UDP. IPv6 L4
+ * offload is not handled here; the driver sets l3t for IPv6 and we would need
+ * to compute the v6 pseudo-header ourselves.
+ */
+/*
+ * IPv6 L4 checksum insertion. net_checksum_calculate() only knows IPv4, but the
+ * driver requests offload for IPv6 too (it sets l3t and still asks for L4CS),
+ * so without this every IPv6 TCP segment we transmit carries a pseudo-header
+ * partial sum and the peer drops it.
+ *
+ * Extension headers are not walked: if the next header is not TCP or UDP the
+ * frame is left alone rather than corrupted.
+ */
+static void enetc_tx_csum_ipv6(uint8_t *frame, size_t len, size_t l3_off)
+{
+    uint8_t *ip6 = frame + l3_off;
+    uint8_t pseudo[40];
+    size_t l4_off, csum_off;
+    uint16_t plen, csum;
+    uint32_t sum;
+    uint8_t nh;
+
+    if (l3_off + sizeof(struct ip6_header) > len) {
+        return;
+    }
+    plen = lduw_be_p(ip6 + 4);
+    nh = ip6[6];
+    if (nh != IP_PROTO_TCP && nh != IP_PROTO_UDP) {
+        return;
+    }
+    l4_off = l3_off + sizeof(struct ip6_header);
+    if (l4_off + plen > len) {
+        return;
+    }
+    csum_off = (nh == IP_PROTO_TCP) ? 16 : 6;
+    if (plen < csum_off + 2) {
+        return;
+    }
+
+    /* The field must read as zero while its own checksum is computed. */
+    stw_be_p(frame + l4_off + csum_off, 0);
+
+    memcpy(pseudo, ip6 + 8, 32);          /* src + dst */
+    stl_be_p(pseudo + 32, plen);          /* upper-layer packet length */
+    stl_be_p(pseudo + 36, nh);            /* zero-padded next header */
+
+    sum = net_checksum_add(sizeof(pseudo), pseudo);
+    sum += net_checksum_add(plen, frame + l4_off);
+    csum = net_checksum_finish(sum);
+    if (nh == IP_PROTO_UDP && csum == 0) {
+        csum = 0xffff;                    /* 0 means "no checksum" for UDP */
+    }
+    stw_be_p(frame + l4_off + csum_off, csum);
+}
+
+static void enetc_tx_insert_csum(uint8_t *frame, size_t len, uint32_t lstatus)
+{
+    size_t l3_off = sizeof(struct eth_header);
+    uint16_t proto;
+    int flags;
+
+    if (!(lstatus & (ENETC_TXBD_FLAGS_L4CS << ENETC_TXBD_FLAGS_OFF))) {
+        return;
+    }
+    if (len < sizeof(struct eth_header)) {
+        return;
+    }
+
+    proto = lduw_be_p(frame + 12);
+    if (proto == ETH_P_VLAN || proto == ETH_P_DVLAN) {
+        l3_off += sizeof(struct vlan_header);
+        if (len < l3_off) {
+            return;
+        }
+        proto = lduw_be_p(frame + 16);
+    }
+
+    if (proto == ETH_P_IPV6) {
+        enetc_tx_csum_ipv6(frame, len, l3_off);
+        return;
+    }
+
+    /* IPv4 (and its VLAN forms) are handled by the shared helper. */
+    flags = CSUM_TCP | CSUM_UDP;
+    if (lstatus & ENETC_TXBD_IPCS) {
+        flags |= CSUM_IP;
+    }
+    net_checksum_calculate(frame, len, flags);
+}
+
+static void enetc_tx_kick(FslEnetcState *s)
+{
+    hwaddr tbase = ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_TX, 0);
+    uint64_t ring = enetc_ring_base(s, tbase + ENETC_TBBAR0);
+    uint32_t len = enetc_reg(s, tbase + ENETC_TBLENR) & ENETC_TBCIR_IDX_MASK;
+    uint32_t pi = enetc_reg(s, tbase + ENETC_TBPIR) & ENETC_TBCIR_IDX_MASK;
+    uint32_t ci = enetc_reg(s, tbase + ENETC_TBCIR) & ENETC_TBCIR_IDX_MASK;
+    PCIDevice *pci = PCI_DEVICE(s);
+    uint8_t frame[ENETC_FRAME_MAX];
+    uint32_t frame_len = 0;
+    uint32_t frame_lstatus = 0;
+
+    if (!len) {
+        return;
+    }
+
+    while (ci != pi) {
+        uint8_t bd[ENETC_BD_SIZE];
+        uint64_t addr;
+        uint16_t buf_len;
+        uint32_t lstatus;
+
+        pci_dma_read(pci, ring + (uint64_t)ci * ENETC_BD_SIZE, bd, sizeof(bd));
+        dma_account("enetc", "txbd", false, sizeof(bd));
+        addr = ldq_le_p(bd);
+        buf_len = lduw_le_p(bd + 8);
+        lstatus = ldl_le_p(bd + 12);
+
+        /* The csum-offload fields live in the FIRST BD of a frame. */
+        if (frame_len == 0) {
+            frame_lstatus = lstatus;
+        }
+
+        if (frame_len + buf_len <= sizeof(frame)) {
+            pci_dma_read(pci, addr, frame + frame_len, buf_len);
+            dma_account("enetc", "txdata", false, buf_len);
+            frame_len += buf_len;
+        }
+
+        if (lstatus & (ENETC_TXBD_FLAGS_F << ENETC_TXBD_FLAGS_OFF)) {
+            if (frame_len) {
+                enetc_tx_insert_csum(frame, frame_len, frame_lstatus);
+                qemu_send_packet(qemu_get_queue(s->nic), frame, frame_len);
+            }
+            frame_len = 0;
+        }
+
+        if (++ci == len) {
+            ci = 0;
+        }
+    }
+
+    enetc_set(s, tbase + ENETC_TBCIR, ci);
+    enetc_ring_irq(s, ENETC_SIMSITRV(0));
+}
+
+static uint64_t fsl_enetc_bar0_read(void *opaque, hwaddr off, unsigned size)
+{
+    FslEnetcState *s = opaque;
+    uint32_t val;
+
+    switch (off) {
+    case ENETC_SI_BASE + ENETC_SICAPR0:
+        return ENETC_SICAPR0_VAL;
+    case ENETC_SI_BASE + ENETC_SIPCAPR0:
+        return 0;
+    case ENETC_GLOBAL_BASE + ENETC_G_EIPBRR0:
+        return ENETC_REV_4_1;
+    /* TX/RX ring status: never busy (teardown completes immediately). */
+    case ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_TX, 0) + ENETC_TBSR:
+    case ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_RX, 0) + ENETC_RBSR:
+    case ENETC_SI_BASE + ENETC_SICBDRSR:
+        return 0;
+    /* Internal MDIO: never busy, no read error. */
+    case ENETC_PORT_BASE + ENETC_IMDIO_BASE + ENETC_MDIO_CFG:
+        return 0;
+    default:
+        val = enetc_reg(s, off);
+        return val;
+    }
+}
+
+/*
+ * Internal xPCS behind the port imdio (0x5030, clause-45). The xpcs driver
+ * probes its id via a "phy" at MDIO addr 16 (xpcs_phy_get_id: IDCODE_HI at
+ * devad0/reg0x2, IDCODE_LO at devad0/reg0x0); id=(HI<<16)|LO must be 0x1b3274cd
+ * so +DW_XPCS_VER_MX95(1) == NXP_MX95_XPCS_ID. The xPCS itself is MDIO addr 0.
+ */
+static uint16_t enetc_imdio_xpcs_read(int port, int devad, int reg)
+{
+    if (port == 16 && devad == 0 && reg == 0x2) {
+        return 0x1b32;      /* IDCODE_HI */
+    }
+    if (port == 16 && devad == 0 && reg == 0x0) {
+        return 0x74cd;      /* IDCODE_LO -> 0x1b3274cd */
+    }
+
+    if (port != 0) {
+        return 0;
+    }
+    /*
+     * imx95 xPCS-phy config sequence polls hardware handshake bits (register
+     * addresses XPCS_PHY_REG(x) = (x & 0x1fffe) >> 1). A static model completes
+     * every handshake at once: SRAM init done, RX adapt ack, RX valid. Its many
+     * wait-for-clear polls already pass (unmodelled regs read 0).
+     */
+    switch (reg) {
+    case 0x809b:                /* PMA ..._SRAM: PMA_SRAM_INIT_DN (bit 0) */
+        return 0x0001;
+    case 0x8098:                /* PMA ..._MISC_STS: RX_ADPT_ACK (bit 12) */
+    case 0x8020:                /* PMA_RX_LSTS: RX_VALID_0 (bit 12) */
+        return 0x1000;
+    default:
+        break;
+    }
+    /* PCS (devad 3) link status for pcs_get_state: report a 10G link up. */
+    if (devad == ENETC_MDIO_MMD_PCS) {
+        if (reg == ENETC_MDIO_STAT1) {
+            return ENETC_MDIO_STAT1_LSTATUS;
+        }
+        if (reg == ENETC_MDIO_PCS_10GBRT_STAT1) {
+            return ENETC_MDIO_PCS_10GBRT_STAT1_BLKLK;
+        }
+    }
+    return 0;
+}
+
+static void fsl_enetc_bar0_write(void *opaque, hwaddr off, uint64_t val,
+                                 unsigned size)
+{
+    FslEnetcState *s = opaque;
+
+    switch (off) {
+    case ENETC_SI_BASE + ENETC_SICBDRPIR:
+        enetc_set(s, off, val);
+        enetc_cbdr_kick(s);
+        return;
+    case ENETC_SI_BASE + ENETC_SITXIDR:
+    case ENETC_SI_BASE + ENETC_SIRXIDR:
+        /* W1C IRQ status: clear written bits. */
+        enetc_set(s, off, enetc_reg(s, off) & ~(uint32_t)val);
+        return;
+    case ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_TX, 0) + ENETC_TBPIR:
+        enetc_set(s, off, val);
+        enetc_tx_kick(s);
+        return;
+    case ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_RX, 0) + ENETC_RBCIR:
+        /* Driver posted more empty RX buffers (consumer index advanced). */
+        enetc_set(s, off, val);
+        return;
+    case ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_RX, 0) + ENETC_RBPIR:
+        /*
+         * RBPIR is hardware-owned in steady state, but the driver writes it
+         * (to 0) when it sets the ring up - Linux in enetc_setup_rxbdr(), and
+         * U-Boot every time it re-inits the interface. Honour the write, or a
+         * second ring setup leaves us producing at a stale index while the
+         * driver polls from 0 and never sees another frame.
+         */
+        s->rx_pi = val & ENETC_RBCIR_IDX_MASK;
+        enetc_set(s, off, val);
+        return;
+    case ENETC_PORT_BASE + ENETC_IMDIO_BASE + ENETC_MDIO_CTL:
+        enetc_set(s, off, val);
+        if (val & ENETC_MDIO_CTL_READ) {
+            int devad = val & 0x1f, port = (val >> 5) & 0x1f;
+            int reg = enetc_reg(s, ENETC_PORT_BASE + ENETC_IMDIO_BASE +
+                                ENETC_MDIO_ADDR) & 0xffff;
+            uint16_t d = enetc_imdio_xpcs_read(port, devad, reg);
+            enetc_set(s, ENETC_PORT_BASE + ENETC_IMDIO_BASE + ENETC_MDIO_DATA,
+                      d);
+        }
+        return;
+    default:
+        enetc_set(s, off, val);
+        return;
+    }
+}
+
+static const MemoryRegionOps fsl_enetc_bar0_ops = {
+    .read = fsl_enetc_bar0_read,
+    .write = fsl_enetc_bar0_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    /*
+     * The driver uses sub-word MMIO (e.g. __raw_readw of PSIPMAR1 for the
+     * MAC high half), and 64-bit reads for SI/port statistics. Accept
+     * 1..8-byte accesses or QEMU raises an external
+     * abort. impl stays word-wide so the handlers only ever see 32-bit
+     * accesses (QEMU extracts/merges the narrow ones).
+     */
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+/* --- NIC backend --- */
+
+/*
+ * Is there room for `need` more RX BDs, starting at the producer index?
+ *
+ * Ownership lives in the descriptor, not in the indices: hardware sets
+ * LSTATUS_R when it fills a BD, and software clears it when it consumes the
+ * BD and posts a fresh buffer. A BD whose R bit is still set has not been
+ * consumed, so writing it would overrun the driver.
+ *
+ * Do NOT infer this from RBPIR/RBCIR. The two drivers keep those indices to
+ * different conventions: Linux writes RBCIR = next_to_use (one past the last
+ * posted buffer), while U-Boot posts the whole ring up front and leaves RBCIR
+ * at 0. An index-difference check reads U-Boot's ring as permanently full and
+ * silently discards every inbound frame - the link comes up, ARP goes out, and
+ * nothing ever arrives.
+ */
+static bool fsl_enetc_rx_has_room(FslEnetcState *s, uint32_t need)
+{
+    hwaddr rbase = ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_RX, 0);
+    uint32_t len = enetc_reg(s, rbase + ENETC_RBLENR) & ENETC_RBCIR_IDX_MASK;
+    uint64_t ring = enetc_ring_base(s, rbase + ENETC_RBBAR0);
+    PCIDevice *pci = PCI_DEVICE(s);
+    uint32_t i;
+
+    if (!len || need > len ||
+        !(enetc_reg(s, rbase + ENETC_RBMR) & ENETC_MR_EN)) {
+        return false;
+    }
+
+    for (i = 0; i < need; i++) {
+        uint32_t idx = (s->rx_pi + i) % len;
+        uint8_t lstatus[4];
+
+        pci_dma_read(pci, ring + (uint64_t)idx * ENETC_BD_SIZE +
+                     ENETC_RXBD_LSTATUS_OFF, lstatus, sizeof(lstatus));
+        dma_account("enetc", "rxbd", false, sizeof(lstatus));
+        if (ldl_le_p(lstatus) & ENETC_RXBD_LSTATUS_R) {
+            return false;       /* not yet consumed by the driver */
+        }
+    }
+    return true;
+}
+
+static bool fsl_enetc_can_receive(NetClientState *nc)
+{
+    /*
+     * Always accept frames from the wire. Real ENETC does not back-pressure
+     * the link when its RX BD ring is empty - it discards the frame (RX
+     * overrun) and bumps a discard counter; see fsl_enetc_receive(). Returning
+     * false here would instead make a peer netdev queue the frame and, in the
+     * case of the socket netdev used to bridge two QEMU instances, park its fd
+     * reader until we flush. That recovery is racy around link-up (a frame
+     * arriving before the driver has posted RX buffers parks the reader, and
+     * re-arming it from the MMIO/flush path does not reliably resume the main
+     * loop), which silently wedged inter-instance RX. Accepting unconditionally
+     * and discarding in fsl_enetc_receive() when no BD is free matches hardware
+     * and keeps the link self-healing - the few frames dropped before ndo_open
+     * finishes posting buffers are covered by upper-layer retransmits.
+     */
+    return true;
+}
+
+/*
+ * Folded 16-bit ones-complement sum of a buffer, matching the kernel's
+ * do_csum() (lib/checksum.c) on a little-endian host: 16-bit words summed
+ * little-endian, a trailing odd byte added as the low byte, carries folded
+ * in. The HW reports CHECKSUM_COMPLETE via the RX BD inet_csum field; the
+ * driver rebuilds skb->csum as csum_unfold(~htons(inet_csum)). Storing ~sum
+ * (network order) over the L3 payload (see the caller) yields the canonical
+ * CHECKSUM_COMPLETE value the receive path expects; without it the field is 0
+ * and the stack faults ("hw csum failure") re-verifying a received packet.
+ */
+static uint16_t fsl_enetc_inet_csum(const uint8_t *buf, size_t len)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i + 1 < len; i += 2) {
+        sum += (uint32_t)buf[i] | ((uint32_t)buf[i + 1] << 8);
+    }
+    if (i < len) {
+        sum += buf[i];
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return (uint16_t)sum;
+}
+
+static ssize_t fsl_enetc_receive(NetClientState *nc, const uint8_t *buf,
+                                 size_t size)
+{
+    FslEnetcState *s = qemu_get_nic_opaque(nc);
+    PCIDevice *pci = PCI_DEVICE(s);
+    hwaddr rbase = ENETC_BDR_BASE + ENETC_BDR(ENETC_BDR_RX, 0);
+    uint64_t ring = enetc_ring_base(s, rbase + ENETC_RBBAR0);
+    uint32_t len = enetc_reg(s, rbase + ENETC_RBLENR) & ENETC_RBCIR_IDX_MASK;
+    uint32_t bufsz = enetc_reg(s, rbase + ENETC_RBBSR);
+    uint32_t need, off;
+    uint16_t inet_csum;
+
+    if (size > ENETC_FRAME_MAX) {
+        return size; /* drop oversized; reported as received */
+    }
+    if (!bufsz) {
+        bufsz = size ? size : 1; /* ring not set up with a buffer size yet */
+    }
+
+    /*
+     * A frame may not fit in one RX buffer (RBBSR), so scatter it across
+     * successive posted BDs: each holds up to bufsz bytes, only the final BD
+     * carries LSTATUS_F. Require enough free BDs up front; if the ring has no
+     * room, discard the frame (RX overrun) - see fsl_enetc_can_receive().
+     * Reporting it as consumed (return size) keeps the sender's net queue
+     * running; upper layers retransmit any frame dropped this way.
+     */
+    need = (size + bufsz - 1) / bufsz;
+    if (need == 0) {
+        need = 1; /* zero-length frame still consumes one BD */
+    }
+    if (!fsl_enetc_rx_has_room(s, need)) {
+        return size; /* no RX buffer posted: discard (overrun) */
+    }
+
+    /*
+     * Checksum covers the L3 payload only: real ENETC parses the L2 header and
+     * begins the running inet checksum at the network header, so the MAC header
+     * is NOT included. The kernel relies on this - eth_type_trans() pulls the
+     * MAC without adjusting skb->csum, and the IPv6/IPv4 receive path only
+     * subtracts the L3 header from the CHECKSUM_COMPLETE value. Including the
+     * MAC here makes the first re-verified RX packet fault ("hw csum failure").
+     * Reported (network order, complemented) in the first BD only, where
+     * enetc_build_skb() reads inet_csum. (Untagged frames assumed; the model
+     * does not deliver VLAN-tagged RX, so the L3 header is at ENETC_L2_HLEN.)
+     */
+    if (size > ENETC_L2_HLEN) {
+        inet_csum = ~fsl_enetc_inet_csum(buf + ENETC_L2_HLEN,
+                                         size - ENETC_L2_HLEN) & 0xffff;
+    } else {
+        inet_csum = 0xffff; /* no L3 payload; ~0 */
+    }
+
+    for (off = 0; off < size || off == 0; ) {
+        uint64_t bd_addr = ring + (uint64_t)s->rx_pi * ENETC_BD_SIZE;
+        uint8_t bd[ENETC_BD_SIZE];
+        uint64_t buf_addr;
+        uint32_t chunk = MIN(bufsz, size - off);
+        bool final = (off + chunk >= size);
+
+        pci_dma_read(pci, bd_addr, bd, sizeof(bd));
+        dma_account("enetc", "rxbd", false, sizeof(bd));
+        buf_addr = ldq_le_p(bd);
+        if (chunk) {
+            pci_dma_write(pci, buf_addr, buf + off, chunk);
+            dma_account("enetc", "rxdata", true, chunk);
+        }
+
+        /*
+         * Write back the BD in the union enetc_rx_bd.r layout: buf_len
+         * (__le16) at offset 8 and lstatus (__le32) at offset 12.
+         *
+         * Every filled BD gets LSTATUS_R ("holds a frame"); only the last BD
+         * of the frame also gets LSTATUS_F. Linux tests lstatus != 0 and uses
+         * F to find the end of a frame, but U-Boot tests R specifically - so a
+         * BD marked F-without-R is invisible to U-Boot's receive path.
+         */
+        memset(bd, 0, sizeof(bd));
+        if (off == 0) {
+            stw_be_p(bd + ENETC_RXBD_INET_CSUM_OFF, inet_csum);
+        }
+        stw_le_p(bd + ENETC_RXBD_BUFLEN_OFF, (uint16_t)chunk);
+        stl_le_p(bd + ENETC_RXBD_LSTATUS_OFF,
+                 ENETC_RXBD_LSTATUS_R | (final ? ENETC_RXBD_LSTATUS_F : 0));
+        pci_dma_write(pci, bd_addr, bd, sizeof(bd));
+        dma_account("enetc", "rxbd", true, sizeof(bd));
+
+        if (++s->rx_pi == len) {
+            s->rx_pi = 0;
+        }
+        off += chunk;
+        if (final) {
+            break;
+        }
+    }
+
+    enetc_set(s, rbase + ENETC_RBPIR, s->rx_pi);
+    enetc_ring_irq(s, ENETC_SIMSIRRV(0));
+
+    return size;
+}
+
+static NetClientInfo net_fsl_enetc_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = fsl_enetc_can_receive,
+    .receive = fsl_enetc_receive,
+};
+
+static void fsl_enetc_reset_regs(FslEnetcState *s)
+{
+    memset(s->regs, 0, FSL_ENETC_BAR0_SIZE);
+    enetc_set(s, ENETC_SI_BASE + ENETC_SICAPR0, ENETC_SICAPR0_VAL);
+    enetc_set(s, ENETC_GLOBAL_BASE + ENETC_G_EIPBRR0, ENETC_REV_4_1);
+    /*
+     * ECAPR2 advertises the BD-ring count (enetc4_pf reads it into
+     * caps.num_{rx,tx}_bdr, surfaced by ethtool/devlink). Silicon resets it to
+     * 0x0008_0008 (8+8 rings); this model services exactly ONE ring pair
+     * (every BDR handler is hardcoded to index 0). Reporting 0 (the old
+     * memset) is false - the model does have one ring - and reporting silicon's
+     * 8 would be worse: Linux could spread traffic across rings 1-7 that this
+     * model silently drops (a ring count does not degrade gracefully). So we
+     * report 0x0001_0001: the truth about the emulation, and the safe
+     * under-report direction. Advertising 8 belongs with a multi-ring model.
+     */
+    enetc_set(s, ENETC_PORT_BASE + ENETC_ECAPR2, 0x00010001);
+}
+
+static void fsl_enetc_realize(PCIDevice *pci_dev, Error **errp)
+{
+    FslEnetcState *s = FSL_ENETC(pci_dev);
+    uint8_t *cfg = pci_dev->config;
+    int ret, i;
+
+    pci_set_word(cfg + PCI_VENDOR_ID, FSL_ENETC_VENDOR_ID);
+    pci_set_word(cfg + PCI_DEVICE_ID, FSL_ENETC_PF_DEVICE_ID);
+    pci_set_word(cfg + PCI_CLASS_DEVICE, PCI_CLASS_NETWORK_ETHERNET);
+    pci_config_set_interrupt_pin(cfg, 0); /* MSI-X only */
+
+    s->regs = g_malloc0(FSL_ENETC_BAR0_SIZE);
+    fsl_enetc_reset_regs(s);
+
+    memory_region_init_io(&s->bar0, OBJECT(s), &fsl_enetc_bar0_ops, s,
+                          "enetc-bar0", FSL_ENETC_BAR0_SIZE);
+    pci_register_bar(pci_dev, 0,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY |
+                     PCI_BASE_ADDRESS_MEM_TYPE_64, &s->bar0);
+
+    ret = msix_init(pci_dev, FSL_ENETC_MSIX_VECTORS,
+                    &s->bar0, FSL_ENETC_MSIX_TABLE_BAR,
+                    FSL_ENETC_MSIX_TABLE_OFF,
+                    &s->bar0, FSL_ENETC_MSIX_TABLE_BAR,
+                    FSL_ENETC_MSIX_PBA_OFF, 0, errp);
+    if (ret) {
+        return;
+    }
+
+    /*
+     * Mark every MSI-X vector as in-use so msix_notify() delivers it. Like
+     * other fully-emulated MSI-X NICs (e1000e, igb, vmxnet3) we do not use
+     * vector-use notifiers; without this, msix_notify() early-returns on
+     * !msix_entry_used and the ring interrupts never reach the guest.
+     */
+    for (i = 0; i < FSL_ENETC_MSIX_VECTORS; i++) {
+        msix_vector_use(pci_dev, i);
+    }
+
+    /*
+     * Modelled as a conventional PCI endpoint (the real ENETC PF is an RCiEP,
+     * but enetc4_pf treats pcie_flr() at probe as best-effort, so the PCIe
+     * capability is not required). A PCIe-cap init here would assert unless
+     * the device is plugged into an express slot.
+     */
+
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&net_fsl_enetc_info, &s->conf,
+                          object_get_typename(OBJECT(s)), pci_dev->qdev.id,
+                          &pci_dev->qdev.mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    /*
+     * The SI primary MAC (PSIPMAR0/1) is seeded in fsl_enetc_reset(), not here:
+     * the device reset runs after realize and memset()s the whole register
+     * file, so a seed placed in realize would be wiped before the guest ever
+     * reads it - the driver's enetc4_pf_get_si_primary_mac() would then read
+     * back 00:00:00:00:00:00.
+     */
+}
+
+static void fsl_enetc_exit(PCIDevice *pci_dev)
+{
+    FslEnetcState *s = FSL_ENETC(pci_dev);
+
+    qemu_del_nic(s->nic);
+    msix_uninit(pci_dev, &s->bar0, &s->bar0);
+    g_free(s->regs);
+}
+
+/*
+ * Seed the SI primary MAC (MAC[0..3] little-endian in xxPMAR0, MAC[4..5] in
+ * xxPMAR1). Two register views must both carry it, because real hardware
+ * mirrors them but this model keeps separate slots:
+ *  - SI-space SIPMAR0/1 (0x80/0x84): read by enetc_load_primary_mac_addr(),
+ *    which sets the Linux netdev's station address. Miss this and the guest's
+ *    eth0 comes up 00:00:00:00:00:00.
+ *  - PORT-space PSIPMAR0/1 (0x2000): read by enetc4_pf_get_si_primary_mac().
+ */
+static void fsl_enetc_seed_primary_mac(FslEnetcState *s)
+{
+    const uint8_t *m = s->conf.macaddr.a;
+    uint32_t lo = m[0] | m[1] << 8 | m[2] << 16 | (uint32_t)m[3] << 24;
+    uint32_t hi = m[4] | m[5] << 8;
+
+    enetc_set(s, ENETC_SI_BASE + ENETC_SIPMAR0, lo);
+    enetc_set(s, ENETC_SI_BASE + ENETC_SIPMAR1, hi);
+    enetc_set(s, ENETC_PORT_BASE + ENETC_PSIPMAR0(0), lo);
+    enetc_set(s, ENETC_PORT_BASE + ENETC_PSIPMAR1(0), hi);
+}
+
+static void fsl_enetc_reset(DeviceState *dev)
+{
+    FslEnetcState *s = FSL_ENETC(dev);
+
+    fsl_enetc_reset_regs(s);
+    s->rx_pi = 0;
+    /*
+     * Re-seed the primary MAC that fsl_enetc_reset_regs() just zeroed, so the
+     * driver reads a valid station address (not 00:00:00:00:00:00) at probe.
+     */
+    fsl_enetc_seed_primary_mac(s);
+}
+
+static const Property fsl_enetc_props[] = {
+    DEFINE_NIC_PROPERTIES(FslEnetcState, conf),
+};
+
+static void fsl_enetc_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = fsl_enetc_realize;
+    k->exit = fsl_enetc_exit;
+    k->vendor_id = FSL_ENETC_VENDOR_ID;
+    k->device_id = FSL_ENETC_PF_DEVICE_ID;
+    k->class_id = PCI_CLASS_NETWORK_ETHERNET;
+    /*
+     * PCI Revision ID = 4 (ENETC_REV4). The i.MX 95 NETC is ENETC v4, and the
+     * driver's is_enetc_rev1()/is_enetc_rev4() key off pdev->revision: rev1
+     * routes the port's in-band PCS through a Lynx PCS, rev4 through the DW
+     * xPCS. A wrong "1" here makes a managed=in-band-status port pick the Lynx
+     * PCS and fail phylink validate for 10gbase-r.
+     */
+    k->revision = 4;
+
+    device_class_set_legacy_reset(dc, fsl_enetc_reset);
+    device_class_set_props(dc, fsl_enetc_props);
+    dc->desc = "NXP ENETC v4 Ethernet PF";
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo fsl_enetc_info = {
+    .name = TYPE_FSL_ENETC,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(FslEnetcState),
+    .class_init = fsl_enetc_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void fsl_enetc_register_types(void)
+{
+    type_register_static(&fsl_enetc_info);
+}
+
+type_init(fsl_enetc_register_types)

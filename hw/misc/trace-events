@@ -460,3 +460,20 @@ launch_update_write(void) ""
 vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
+
+# imx_mu.c
+imx_mu_scmi_request(uint8_t proto, uint8_t msg, uint8_t type, uint16_t token, uint32_t res0) "SCMI req proto=0x%02x msg=0x%02x type=%u token=%u res0=0x%08x"
+
+# imx95_mali.c
+imx95_mali_read(uint64_t offset, uint32_t value, unsigned size) "offset=0x%" PRIx64 " value=0x%08x size=%u"
+imx95_mali_write(uint64_t offset, uint64_t value, unsigned size) "offset=0x%" PRIx64 " value=0x%" PRIx64 " size=%u"
+imx95_mali_irq(uint32_t raw, uint32_t mask, uint32_t status) "raw=0x%08x mask=0x%08x status=0x%08x"
+
+# Local staged Mali address-space translation (disabled unless selected).
+imx95_mali_mmu_fault(unsigned as, uint64_t addr, uint32_t status) "as=%u va=0x%" PRIx64 " status=0x%x"
+imx95_mali_mmu_translate(unsigned as, uint64_t addr, uint64_t pa, unsigned perm) "as=%u va=0x%" PRIx64 " pa=0x%" PRIx64 " perm=%u"
+
+imx95_mali_mcu_state(uint32_t control, uint32_t status, uint32_t pc) "control=%u status=%u pc=0x%x"
+imx95_mali_mcu_mmio(bool write, uint64_t addr, uint64_t value, unsigned size, uint32_t pc) "write=%d addr=0x%" PRIx64 " value=0x%" PRIx64 " size=%u pc=0x%x unsupported"
+
+imx95_mali_mcu_map(unsigned as, uint64_t base) "as=%u gpu-base=0x%" PRIx64 " lower-64MiB-window"

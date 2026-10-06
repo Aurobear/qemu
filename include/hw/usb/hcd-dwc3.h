@@ -41,6 +41,11 @@
 typedef struct USBDWC3 {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
+    /* Local i.MX95 control-plane experiment; no gadget transfer engine. */
+    MemoryRegion device_iomem;
+    bool imx95_drd_control;
+    uint32_t device_regs[0x900 / 4];
+    uint32_t device_stalled;
     XHCISysbusState sysbus_xhci;
 
     uint32_t regs[USB_DWC3_R_MAX];

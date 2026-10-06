@@ -31,6 +31,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/register.h"
 #include "qemu/bitops.h"
+#include "qemu/log.h"
 #include "qom/object.h"
 #include "migration/vmstate.h"
 #include "hw/core/qdev-properties.h"
@@ -346,6 +347,100 @@ REG32(GFLADJ, 0x530)
 REG32(GUSB2RHBCTL, 0x540)
     FIELD(GUSB2RHBCTL, OVRD_L1TIMEOUT, 0, 4)
 
+/*
+ * Optional i.MX95 dual-role control plane. Linux needs DCTL reset and a
+ * role-switch provider even for an unplugged Type-C port. Do not let these
+ * accesses fall through to a reads-as-zero stub. Transfers and device events
+ * are deliberately unsupported: STARTTRANSFER returns an error, not success.
+ */
+#define DWC3_DEVICE_OFFSET 0xc700
+#define DEV_DCFG  0x00
+#define DEV_DCTL  0x04
+#define DEV_DSTS  0x0c
+#define DEV_DGCMD 0x14
+#define DEV_CMD_ACTIVE (1u << 10)
+#define DEV_CMD_ERROR  (1u << 12)
+#define DEV_HALTED     (1u << 22)
+
+static void usb_dwc3_device_reset(USBDWC3 *s)
+{
+    memset(s->device_regs, 0, sizeof(s->device_regs));
+    s->device_regs[DEV_DSTS / 4] = DEV_HALTED;
+    s->device_stalled = 0;
+}
+
+static uint64_t usb_dwc3_device_read(void *opaque, hwaddr offset, unsigned size)
+{
+    USBDWC3 *s = opaque;
+
+    return s->device_regs[offset / 4];
+}
+
+static void usb_dwc3_device_write(void *opaque, hwaddr offset,
+                                  uint64_t value, unsigned size)
+{
+    USBDWC3 *s = opaque;
+    uint32_t v = value;
+
+    if (offset == DEV_DSTS) {
+        return; /* Status is read-only. */
+    }
+    if (offset == DEV_DCTL) {
+        if (v & (1u << 30)) { /* Core soft reset completes synchronously. */
+            usb_dwc3_device_reset(s);
+            return;
+        }
+        /* No USB peer/link backend: stay in Rx.Detect, never report U0. */
+        s->device_regs[DEV_DSTS / 4] = (v & (1u << 31)) ?
+                                     (5u << 18) : DEV_HALTED;
+    } else if (offset == DEV_DGCMD && (v & DEV_CMD_ACTIVE)) {
+        /* No generic device commands supported by this limited backend. */
+        v = (v & ~(DEV_CMD_ACTIVE | 0xf000)) | DEV_CMD_ERROR;
+        qemu_log_mask(LOG_UNIMP, "imx95-dwc3: unsupported DGCMD 0x%x\n", v);
+    } else if (offset >= 0x10c && offset <= 0x2fc &&
+               (offset & 0xf) == 0xc && (v & DEV_CMD_ACTIVE)) {
+        unsigned ep = (offset - 0x10c) / 16;
+        unsigned command = v & 0xf;
+
+        v &= ~(DEV_CMD_ACTIVE | 0xf000);
+        switch (command) {
+        case 1: /* SETEPCONFIG: parameter registers hold endpoint configuration. */
+        case 2: /* SETTRANSFRESOURCE: configuration only, no transfer started. */
+        case 8: /* ENDTRANSFER: there cannot be an active transfer. */
+            break;
+        case 4: /* SETSTALL */
+            s->device_stalled |= 1u << ep;
+            break;
+        case 5: /* CLEARSTALL */
+            s->device_stalled &= ~(1u << ep);
+            break;
+        case 9: /* STARTNEWCONFIG */
+            s->device_stalled = 0;
+            break;
+        default:
+            /* In particular STARTTRANSFER/UPDATETRANSFER must not fake DMA. */
+            v |= DEV_CMD_ERROR;
+            qemu_log_mask(LOG_UNIMP,
+                          "imx95-dwc3: unsupported DEPCMD %u on ep%u\n",
+                          command, ep);
+            break;
+        }
+        if (v & (1u << 8)) { /* No device command-completion event backend. */
+            v |= DEV_CMD_ERROR;
+            qemu_log_mask(LOG_UNIMP, "imx95-dwc3: CMDIOC not modelled\n");
+        }
+    }
+    s->device_regs[offset / 4] = v;
+}
+
+static const MemoryRegionOps usb_dwc3_device_ops = {
+    .read = usb_dwc3_device_read,
+    .write = usb_dwc3_device_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 #define DWC3_GLOBAL_OFFSET 0xC100
 static void reset_csr(USBDWC3 * s)
 {
@@ -379,6 +474,9 @@ static void reset_csr(USBDWC3 * s)
         }
     }
 
+    if (s->imx95_drd_control) {
+        usb_dwc3_device_reset(s);
+    }
     xhci_sysbus_reset(DEVICE(&s->sysbus_xhci));
 }
 
@@ -584,6 +682,9 @@ static void usb_dwc3_reset(DeviceState *dev)
         };
     }
 
+    if (s->imx95_drd_control) {
+        usb_dwc3_device_reset(s);
+    }
     xhci_sysbus_reset(DEVICE(&s->sysbus_xhci));
 }
 
@@ -616,6 +717,11 @@ static void usb_dwc3_realize(DeviceState *dev, Error **errp)
     /*
      * Device Configuration
      */
+    if (s->imx95_drd_control) {
+        s->cfg.mode = 2; /* Dual role, with the limited device control backend. */
+        memory_region_add_subregion(&s->iomem, DWC3_DEVICE_OFFSET,
+                                    &s->device_iomem);
+    }
     s->regs[R_GHWPARAMS0] = 0x40204048 | s->cfg.mode;
     s->regs[R_GHWPARAMS1] = 0x222493b;
     s->regs[R_GHWPARAMS2] = 0x12345678;
@@ -633,6 +739,8 @@ static void usb_dwc3_init(Object *obj)
     RegisterInfoArray *reg_array;
 
     memory_region_init(&s->iomem, obj, TYPE_USB_DWC3, DWC3_SIZE);
+    memory_region_init_io(&s->device_iomem, obj, &usb_dwc3_device_ops, s,
+                         "imx95-dwc3-device-control", sizeof(s->device_regs));
     reg_array =
         register_init_block32(DEVICE(obj), usb_dwc3_regs_info,
                               ARRAY_SIZE(usb_dwc3_regs_info),
@@ -652,16 +760,21 @@ static void usb_dwc3_init(Object *obj)
 
 static const VMStateDescription vmstate_usb_dwc3 = {
     .name = "usb-dwc3",
-    .version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, USBDWC3, USB_DWC3_R_MAX),
         VMSTATE_UINT8(cfg.mode, USBDWC3),
         VMSTATE_UINT32(cfg.dwc_usb3_user, USBDWC3),
+        VMSTATE_BOOL_V(imx95_drd_control, USBDWC3, 2),
+        VMSTATE_UINT32_ARRAY_V(device_regs, USBDWC3, 0x900 / 4, 2),
+        VMSTATE_UINT32_V(device_stalled, USBDWC3, 2),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const Property usb_dwc3_properties[] = {
+    DEFINE_PROP_BOOL("imx95-drd-control", USBDWC3, imx95_drd_control, false),
     DEFINE_PROP_UINT32("DWC_USB3_USERID", USBDWC3, cfg.dwc_usb3_user,
                        0x12345678),
 };

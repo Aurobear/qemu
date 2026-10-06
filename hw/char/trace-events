@@ -1,5 +1,11 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# imx_lpuart.c (default-off local diagnostics)
+imx_lpuart_control(void *uart, uint32_t ctrl, uint32_t baud) "uart=%p ctrl=0x%x baud=0x%x"
+imx_lpuart_rx(void *uart, uint8_t byte, uint32_t ctrl, uint32_t baud) "uart=%p byte=0x%02x ctrl=0x%x baud=0x%x"
+imx_lpuart_dma_irq(void *uart, uint32_t stat, uint32_t ctrl, bool level) "uart=%p stat=0x%x ctrl=0x%x level=%d"
+imx_lpuart_dma_mmio(void *uart, bool write, uint64_t offset, uint32_t value) "uart=%p write=%d offset=0x%"PRIx64" value=0x%x"
+
 # parallel.c
 parallel_ioport_read(const char *desc, uint16_t addr, uint8_t value) "read [%s] addr 0x%02x val 0x%02x"
 parallel_ioport_write(const char *desc, uint16_t addr, uint8_t value) "write [%s] addr 0x%02x val 0x%02x"

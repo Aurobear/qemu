@@ -13,3 +13,5 @@ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_dma.c'))
 system_ss.add(when: 'CONFIG_SIFIVE_PDMA', if_true: files('sifive_pdma.c'))
 system_ss.add(when: 'CONFIG_XLNX_CSU_DMA', if_true: files('xlnx_csu_dma.c'))
 system_ss.add(when: 'CONFIG_K230_GSDMA', if_true: files('k230_gsdma.c'))
+
+system_ss.add(when: 'CONFIG_IMX95_EDMA', if_true: files('imx95_edma.c'))

@@ -1,0 +1,468 @@
+/*
+ * NXP i.MX 95 NETC EMDIO - external MDIO controller (PCI endpoint 1131:ee00)
+ *
+ * Copyright (c) 2026, Kyle Fox
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * The NETC block exposes its external MDIO as a PCI function on the bus-1 ECAM
+ * (netc-blk-ctrl@4cde0000/pcie@4cb00000/mdio@0,0). The enetc_pci_mdio driver
+ * binds PCI 1131:ee00 and maps a clause-22/45 MDIO register file at BAR0 +
+ * ENETC_EMDIO_BASE (0x1c00): CFG(0x0, BSY/RD_ER/ENC45), CTL(0x4, devad[4:0] |
+ * port[9:5] | READ bit15), DATA(0x8), ADDR(0xc).
+ *
+ * The 19x19 EVK wires an Aquantia c45 10G PHY at MDIO addr 8 (ethernet-phy@8,
+ * the ethernet@10,0 phy-handle). We embed a minimal c45 PHY at addr 8 so the
+ * mdio bus registers and that phy-handle resolves (the 10G port's LINK itself
+ * comes from the port's internal xPCS via managed = "in-band-status", modelled
+ * separately). FRDM instead has two independent clause-22 PHYs at 1/2.
+ * Board properties select the topology; absent addresses return RD_ER.
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
+#include "qapi/error.h"
+#include "migration/vmstate.h"
+
+#define TYPE_IMX95_NETC_EMDIO "imx95-netc-emdio"
+OBJECT_DECLARE_SIMPLE_TYPE(IMX95NetcEmdio, IMX95_NETC_EMDIO)
+
+#define EMDIO_VENDOR_ID     0x1131      /* PCI_VENDOR_ID_NXP2 (Philips) */
+#define EMDIO_DEVICE_ID     0xee00      /* PCI_DEVICE_ID_NXP2_NETC_EMDIO */
+
+#define EMDIO_BAR0_SIZE     0x10000   /* 64K; fits the 4cb00000 window */
+#define EMDIO_MDIO_BASE     0x1c00      /* ENETC_EMDIO_BASE */
+
+/* MDIO register file (relative to EMDIO_MDIO_BASE). */
+#define MDIO_CFG            0x0
+#define MDIO_CTL            0x4
+#define MDIO_DATA           0x8
+#define MDIO_ADDR           0xc
+
+#define MDIO_CFG_BSY        (1u << 0)
+#define MDIO_CFG_RD_ER      (1u << 1)
+#define MDIO_CFG_ENC45      (1u << 6)
+
+#define MDIO_CTL_DEV_ADDR(x)  ((x) & 0x1f)
+#define MDIO_CTL_PORT_ADDR(x) (((x) >> 5) & 0x1f)
+#define MDIO_CTL_READ         (1u << 15)
+
+#define AQR_PHY_ADDR        8
+
+/*
+ * Clause-22 copper PHY at MDIO address 1. The real 19x19 EVK has a 1 Gb
+ * YT8521 there (silicon dmesg: "PHY [0003:01:00.0:01] driver [YT8521]"), and
+ * the stock device tree's ethernet-phy@1 points at it. Without something
+ * answering C22 at this address U-Boot's enetc probe fails outright ("Could
+ * not get PHY for emdio-0: addr 1" -> "No ethernet found"), which is what kept
+ * U-Boot from having any network at all.
+ *
+ * We present a generic auto-negotiated 1000BASE-T full-duplex PHY rather than
+ * a YT8521: a vendor ID would pull in that vendor's init sequence, which pokes
+ * extended registers we do not model. genphy is the honest, working choice.
+ */
+#define C22_PHY_ADDR        1
+
+#define C22_BMCR            0x00
+#define C22_BMSR            0x01
+#define C22_PHYSID1         0x02
+#define C22_PHYSID2         0x03
+#define C22_ADVERTISE       0x04
+#define C22_LPA             0x05
+#define C22_CTRL1000        0x09
+#define C22_STAT1000        0x0a
+#define C22_ESTATUS         0x0f
+
+/*
+ * A flat-zero PHY ID reads as "no device" (U-Boot's create_phy_by_mask skips
+ * it, since a C45 PHY answers 0 to C22 reads), and an all-ones ID likewise.
+ * Use a non-zero ID that matches no vendor driver, so both U-Boot and Linux
+ * fall back to their generic PHY driver rather than running a vendor init
+ * sequence against registers we do not model.
+ */
+#define C22_PHYSID1_VALUE   0x0000
+#define C22_PHYSID2_VALUE   0x00a0
+
+/* Link up, autoneg done+capable, extended status present, 10/100 abilities. */
+#define C22_BMSR_VALUE      0x796d
+#define C22_LPA_VALUE       0x41e1      /* ACK + 100/10 full+half */
+#define C22_STAT1000_VALUE  0x0800      /* link partner 1000BASE-T full */
+#define C22_ESTATUS_VALUE   0x2000      /* 1000BASE-T full capable */
+
+/* c45 status/id register numbers (per MMD). */
+#define C45_STAT1           0x0001      /* MDIO_STAT1 (LSTATUS bit 2) */
+#define C45_PHYSID1         0x0002
+#define C45_PHYSID2         0x0003
+#define C45_DEVS2           0x0005      /* devices-in-package, MMD 16..31 */
+#define C45_DEVS1           0x0006      /* devices-in-package, MMD 1..15 */
+#define C45_STAT2           0x0008      /* DEVPRST bits [15:14] */
+
+#define MDIO_STAT1_LSTATUS  (1u << 2)
+#define MDIO_STAT2_DEVPRST  0x8000      /* present: bit15 set, 14 clear */
+
+/* c45 MMD (device address) numbers. */
+#define MDIO_MMD_PMAPMD     1
+#define MDIO_MMD_PCS        3
+#define MDIO_MMD_PHYXS      4
+#define MDIO_MMD_AN         7
+#define MDIO_MMD_VEND1      30
+
+/* PMA/PMD (MMD 1) speed-ability registers genphy_c45 reads for features. The
+ * AQR113C is a multi-gig BASE-T PHY, so it reports copper 10G/5G/2.5G via the
+ * extended-ability tables (must match the xPCS mx95 10G features: 10000baseT +
+ * multi-gig T, not fibre SR/LR - an empty intersection fails validate). */
+#define C45_PMA_STAT2_EXTABLE 0x0200
+#define C45_PMA_EXTABLE       0x000b
+#define C45_PMA_EXTABLE_10GBT 0x0004
+#define C45_PMA_EXTABLE_NBT   0x4000    /* 2.5/5GBASE-T -> NG_EXTABLE */
+#define C45_PMA_NG_EXTABLE    0x0015
+#define C45_PMA_NG_EXTABLE_2_5G 0x0001
+#define C45_PMA_NG_EXTABLE_5G   0x0002
+
+/* Aquantia AQR113C vendor (MMD 30) registers the aqr driver probe touches. */
+#define AQR_VEND1_FW_ID       0x0020    /* non-zero => fw loaded */
+#define AQR_VEND1_GEN_STAT2   0xc831    /* bit15 OP_IN_PROG; return clear */
+#define AQR_VEND1_CFG_10M     0x031a    /* media-speed serdes cfg regs */
+#define AQR_VEND1_CFG_10G     0x031f    /* .. to 10G (SERDES_MODE [2:0]) */
+#define AQR_CFG_SERDES_SGMII  0x0003    /* non-zero; low speeds report SGMII */
+#define AQR_CFG_SERDES_XFI    0x0000    /* 10G reports XFI => 10GBASE-R */
+
+/* Aquantia AQR113C: MII PHY id 0x31c31c12 (OUI 0x03a1b4, model/rev in id2). */
+#define AQR_PHYSID1         0x31c3
+#define AQR_PHYSID2         0x1c12
+/* devices-in-package: PMA/PMD(1), PCS(3), PHY XS(4), AN(7) + vend 30/31 */
+#define AQR_DEVS1           ((1u << 1) | (1u << 3) | (1u << 4) | (1u << 7))
+#define AQR_DEVS2           ((1u << (30 - 16)) | (1u << (31 - 16)))
+
+struct IMX95NetcEmdio {
+    PCIDevice parent_obj;
+    MemoryRegion bar0;
+    uint32_t cfg;
+    uint32_t ctl;
+    uint32_t data;
+    uint32_t addr;
+
+    /* Independent register banks for addresses 1 and (optionally) 2. */
+    uint8_t c22_phy_count;
+    bool aqr_phy;
+    uint16_t c22_bmcr[2];
+    uint16_t c22_advertise[2];
+    uint16_t c22_ctrl1000[2];
+};
+
+static void c22_phy_reset(IMX95NetcEmdio *s, int phy)
+{
+    s->c22_bmcr[phy] = 0x1140;
+    s->c22_advertise[phy] = 0x01e1;
+    s->c22_ctrl1000[phy] = 0x0200;
+}
+
+/* Clause-22 register access; phy is the independent zero-based bank. */
+static uint16_t c22_phy_read(IMX95NetcEmdio *s, int phy, int reg)
+{
+    switch (reg) {
+    case C22_BMCR:
+        return s->c22_bmcr[phy];
+    case C22_BMSR:
+        return C22_BMSR_VALUE;
+    case C22_PHYSID1:
+        return C22_PHYSID1_VALUE;
+    case C22_PHYSID2:
+        return C22_PHYSID2_VALUE;
+    case C22_ADVERTISE:
+        return s->c22_advertise[phy];
+    case C22_LPA:
+        return C22_LPA_VALUE;
+    case C22_CTRL1000:
+        return s->c22_ctrl1000[phy];
+    case C22_STAT1000:
+        return C22_STAT1000_VALUE;
+    case C22_ESTATUS:
+        return C22_ESTATUS_VALUE;
+    default:
+        return 0;
+    }
+}
+
+static void c22_phy_write(IMX95NetcEmdio *s, int phy, int reg, uint16_t val)
+{
+    switch (reg) {
+    case C22_BMCR:
+        /* A reset affects only this PHY, not the other MDIO address. */
+        if (val & 0x8000) {
+            c22_phy_reset(s, phy);
+        } else {
+            /* Restart-autoneg completes immediately in this functional model. */
+            s->c22_bmcr[phy] = val & ~0x0200;
+        }
+        break;
+    case C22_ADVERTISE:
+        s->c22_advertise[phy] = val;
+        break;
+    case C22_CTRL1000:
+        s->c22_ctrl1000[phy] = val;
+        break;
+    default:
+        break;
+    }
+}
+
+/* Model the embedded Aquantia AQR113C c45 PHY at MDIO addr 8. */
+static uint16_t aqr_c45_read(int devad, int reg)
+{
+    /* Aquantia vendor MMD: let the aqr driver's probe/config_init succeed. */
+    if (devad == MDIO_MMD_VEND1) {
+        if (reg == AQR_VEND1_FW_ID) {
+            return 0x0501;              /* fw v5.1 present => skip fw load */
+        }
+        if (reg == AQR_VEND1_GEN_STAT2) {
+            return 0;                   /* OP_IN_PROG clear (not busy) */
+        }
+        if (reg >= AQR_VEND1_CFG_10M && reg < AQR_VEND1_CFG_10G) {
+            return AQR_CFG_SERDES_SGMII; /* low media speeds: SGMII, non-zero */
+        }
+        if (reg == AQR_VEND1_CFG_10G) {
+            return AQR_CFG_SERDES_XFI;   /* 10G: XFI serdes => 10GBASE-R host */
+        }
+        return 0;
+    }
+
+    switch (reg) {
+    case C45_DEVS1:
+        return AQR_DEVS1;
+    case C45_DEVS2:
+        return AQR_DEVS2;
+    case C45_PHYSID1:
+        return AQR_PHYSID1;
+    case C45_PHYSID2:
+        return AQR_PHYSID2;
+    case C45_STAT2:
+        /*
+         * PMA/PMD STAT2 doubles as the c45 device-present marker (bits[15:14])
+         * and a speed-ability register. Set EXTABLE so genphy_c45 reads the
+         * extended tables below for the copper 10G/multi-gig abilities.
+         */
+        if (devad == MDIO_MMD_PMAPMD) {
+            return MDIO_STAT2_DEVPRST | C45_PMA_STAT2_EXTABLE;
+        }
+        return MDIO_STAT2_DEVPRST;
+    case C45_PMA_EXTABLE:
+        /* 10GBASE-T + the 2.5/5G marker (NG_EXTABLE has the detail). */
+        if (devad == MDIO_MMD_PMAPMD) {
+            return C45_PMA_EXTABLE_10GBT | C45_PMA_EXTABLE_NBT;
+        }
+        return 0;
+    case C45_PMA_NG_EXTABLE:
+        if (devad == MDIO_MMD_PMAPMD) {
+            return C45_PMA_NG_EXTABLE_2_5G | C45_PMA_NG_EXTABLE_5G;
+        }
+        return 0;
+    case C45_STAT1:
+        /* PMA/PMD + PCS report link up: the phy sees a live 10G PHY. */
+        if (devad == MDIO_MMD_PMAPMD || devad == MDIO_MMD_PCS ||
+            devad == MDIO_MMD_PHYXS || devad == MDIO_MMD_AN) {
+            return MDIO_STAT1_LSTATUS;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* Run the MDIO transaction the driver just kicked (CTL write). */
+static void emdio_do_ctl(IMX95NetcEmdio *s, uint32_t ctl)
+{
+    int port = MDIO_CTL_PORT_ADDR(ctl);
+    int devad = MDIO_CTL_DEV_ADDR(ctl);
+
+    s->ctl = ctl;
+    s->cfg &= ~MDIO_CFG_RD_ER;
+
+    /*
+     * With CFG.ENC45 clear the transaction is clause 22 and the CTL "device
+     * address" field carries the register number instead (enetc_mdio.c builds
+     * ENETC_MDC_RA(regnum) into the same bits).
+     */
+    if (!(s->cfg & MDIO_CFG_ENC45)) {
+        if (port < C22_PHY_ADDR || port >= C22_PHY_ADDR + s->c22_phy_count) {
+            s->cfg |= MDIO_CFG_RD_ER;   /* no clause-22 device here */
+            s->data = 0xffff;
+            return;
+        }
+        if (ctl & MDIO_CTL_READ) {
+            s->data = c22_phy_read(s, port - C22_PHY_ADDR, devad);
+        } else {
+            c22_phy_write(s, port - C22_PHY_ADDR, devad, s->data & 0xffff);
+        }
+        return;
+    }
+
+    if (!(ctl & MDIO_CTL_READ)) {
+        return;                 /* address/port latch only */
+    }
+    if (s->aqr_phy && port == AQR_PHY_ADDR) {
+        s->data = aqr_c45_read(devad, s->addr & 0xffff);
+    } else {
+        s->cfg |= MDIO_CFG_RD_ER;   /* no device at this address */
+        s->data = 0xffff;
+    }
+}
+
+static uint64_t emdio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    IMX95NetcEmdio *s = opaque;
+
+    if (offset < EMDIO_MDIO_BASE ||
+        offset >= EMDIO_MDIO_BASE + 0x10) {
+        return 0;
+    }
+    switch (offset - EMDIO_MDIO_BASE) {
+    case MDIO_CFG:
+        return s->cfg & ~MDIO_CFG_BSY;   /* never busy: instant completion */
+    case MDIO_CTL:
+        return s->ctl;
+    case MDIO_DATA:
+        return s->data;
+    case MDIO_ADDR:
+        return s->addr;
+    default:
+        return 0;
+    }
+}
+
+static void emdio_write(void *opaque, hwaddr offset, uint64_t value,
+                        unsigned size)
+{
+    IMX95NetcEmdio *s = opaque;
+
+    if (offset < EMDIO_MDIO_BASE ||
+        offset >= EMDIO_MDIO_BASE + 0x10) {
+        return;
+    }
+    switch (offset - EMDIO_MDIO_BASE) {
+    case MDIO_CFG:
+        s->cfg = value;
+        break;
+    case MDIO_CTL:
+        emdio_do_ctl(s, value);
+        break;
+    case MDIO_DATA:
+        s->data = value;        /* c45 write payload (PHY writes are no-ops) */
+        break;
+    case MDIO_ADDR:
+        s->addr = value;
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps emdio_bar0_ops = {
+    .read = emdio_read,
+    .write = emdio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static void emdio_realize(PCIDevice *pci_dev, Error **errp)
+{
+    IMX95NetcEmdio *s = IMX95_NETC_EMDIO(pci_dev);
+    uint8_t *cfg = pci_dev->config;
+
+    if (s->c22_phy_count < 1 || s->c22_phy_count > 2) {
+        error_setg(errp, "c22-phy-count must be 1 or 2");
+        return;
+    }
+    for (int phy = 0; phy < 2; phy++) {
+        c22_phy_reset(s, phy);
+    }
+
+    pci_set_word(cfg + PCI_VENDOR_ID, EMDIO_VENDOR_ID);
+    pci_set_word(cfg + PCI_DEVICE_ID, EMDIO_DEVICE_ID);
+    pci_set_word(cfg + PCI_CLASS_DEVICE, PCI_CLASS_SYSTEM_OTHER);
+    pci_config_set_prog_interface(cfg, 0x01);
+    pci_config_set_interrupt_pin(cfg, 0);
+
+    memory_region_init_io(&s->bar0, OBJECT(s), &emdio_bar0_ops, s,
+                          "emdio-bar0", EMDIO_BAR0_SIZE);
+    pci_register_bar(pci_dev, 0,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY |
+                     PCI_BASE_ADDRESS_MEM_TYPE_64, &s->bar0);
+}
+
+static const VMStateDescription vmstate_emdio = {
+    .name = TYPE_IMX95_NETC_EMDIO,
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, IMX95NetcEmdio),
+        VMSTATE_UINT32(cfg, IMX95NetcEmdio),
+        VMSTATE_UINT32(ctl, IMX95NetcEmdio),
+        VMSTATE_UINT32(data, IMX95NetcEmdio),
+        VMSTATE_UINT32(addr, IMX95NetcEmdio),
+        VMSTATE_UINT16_ARRAY_V(c22_bmcr, IMX95NetcEmdio, 2, 2),
+        VMSTATE_UINT16_ARRAY_V(c22_advertise, IMX95NetcEmdio, 2, 2),
+        VMSTATE_UINT16_ARRAY_V(c22_ctrl1000, IMX95NetcEmdio, 2, 2),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void emdio_reset(DeviceState *dev)
+{
+    IMX95NetcEmdio *s = IMX95_NETC_EMDIO(dev);
+
+    s->cfg = s->ctl = s->data = s->addr = 0;
+    for (int phy = 0; phy < 2; phy++) {
+        c22_phy_reset(s, phy);
+    }
+}
+
+static const Property emdio_properties[] = {
+    DEFINE_PROP_UINT8("c22-phy-count", IMX95NetcEmdio, c22_phy_count, 1),
+    DEFINE_PROP_BOOL("aqr-phy", IMX95NetcEmdio, aqr_phy, true),
+};
+
+static void emdio_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = emdio_realize;
+    k->vendor_id = EMDIO_VENDOR_ID;
+    k->device_id = EMDIO_DEVICE_ID;
+    /*
+     * Real i.MX 95 silicon presents EMDIO as a system peripheral (class 0880,
+     * prog-if 01) at revision 4, not as an Ethernet controller. The kernel
+     * binds enetc_pci_mdio by vendor/device ID, so this is identification
+     * only, but lspci in the guest should match the board.
+     */
+    k->class_id = PCI_CLASS_SYSTEM_OTHER;
+    k->revision = 4;
+    dc->desc = "i.MX 95 NETC EMDIO (MDIO + Aquantia c45 PHY)";
+    dc->vmsd = &vmstate_emdio;
+    device_class_set_props(dc, emdio_properties);
+    device_class_set_legacy_reset(dc, emdio_reset);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo emdio_info = {
+    .name          = TYPE_IMX95_NETC_EMDIO,
+    .parent        = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(IMX95NetcEmdio),
+    .class_init    = emdio_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_PCIE_DEVICE },
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void emdio_register_types(void)
+{
+    type_register_static(&emdio_info);
+}
+
+type_init(emdio_register_types)

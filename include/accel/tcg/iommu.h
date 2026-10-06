@@ -17,6 +17,7 @@
 
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
+#include "system/memory.h"
 
 void tcg_iommu_init_notifier_list(CPUState *cpu);
 void tcg_iommu_free_notifier_list(CPUState *cpu);
@@ -27,7 +28,9 @@ MemoryRegionSection *address_space_translate_for_iotlb(CPUState *cpu,
                                                        hwaddr *xlat,
                                                        hwaddr *plen,
                                                        MemTxAttrs attrs,
-                                                       int *prot);
+                                                       int *prot,
+                                                       IOMMUAccessFlags access,
+                                                       hwaddr access_offset);
 
 #endif
 

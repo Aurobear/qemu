@@ -1,4 +1,5 @@
 system_ss.add(when: 'CONFIG_A9_GTIMER', if_true: files('a9gtimer.c'))
+system_ss.add(when: 'CONFIG_IMX95_SYSCTR', if_true: files('imx95_sysctr.c'))
 system_ss.add(when: 'CONFIG_ALLWINNER_A10_PIT', if_true: files('allwinner-a10-pit.c'))
 system_ss.add(when: 'CONFIG_ARM_MPTIMER', if_true: files('arm_mptimer.c'))
 system_ss.add(when: 'CONFIG_ARM_TIMER', if_true: files('arm_timer.c'))
@@ -36,3 +37,5 @@ system_ss.add(when: 'CONFIG_SIFIVE_PWM', if_true: files('sifive_pwm.c'))
 system_ss.add(when: 'CONFIG_AVR_TIMER16', if_true: files('avr_timer16.c'))
 
 system_ss.add(when: 'CONFIG_HEX_QTIMER', if_true: files('qct-qtimer.c'))
+
+system_ss.add(when: 'CONFIG_FSL_IMX95', if_true: files('imx95_lptmr.c'))

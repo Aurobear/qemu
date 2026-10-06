@@ -117,6 +117,12 @@ typedef struct SDHCIState SDHCIState;
  */
 #define SDHCI_QUIRK_NO_BUSY_IRQ    BIT(14)
 
+/* Local i.MX95 model: card clock is auto-gated, not generic SDHCI CLKCON. */
+#define SDHCI_QUIRK_IMX95_CLOCK    BIT(16)
+
+/* Local i.MX95 uSDHC: no generic SDHCI Host SDMA Buffer Boundary. */
+#define SDHCI_QUIRK_IMX95_SDMA     BIT(17)
+
 #define TYPE_PCI_SDHCI "sdhci-pci"
 DECLARE_INSTANCE_CHECKER(SDHCIState, PCI_SDHCI,
                          TYPE_PCI_SDHCI)

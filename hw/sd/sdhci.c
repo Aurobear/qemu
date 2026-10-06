@@ -670,7 +670,8 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
      * possible stop at page boundary if initial address is not page aligned,
      * allow them to work properly
      */
-    if ((sdma_address % boundary_chk) == 0) {
+    if (!(s->quirks & SDHCI_QUIRK_IMX95_SDMA) &&
+        (sdma_address % boundary_chk) == 0) {
         page_aligned = true;
     }
 
@@ -1071,7 +1072,13 @@ static void sdhci_data_transfer(void *opaque)
 
 static bool sdhci_can_issue_command(SDHCIState *s)
 {
-    if (!SDHC_CLOCK_IS_ON(s->clkcon) ||
+    bool clock_on = SDHC_CLOCK_IS_ON(s->clkcon);
+
+    if (s->quirks & SDHCI_QUIRK_IMX95_CLOCK) {
+        clock_on = (s->clkcon & (SDHC_CLOCK_INT_EN | SDHC_CLOCK_INT_STABLE)) ==
+                   (SDHC_CLOCK_INT_EN | SDHC_CLOCK_INT_STABLE);
+    }
+    if (!clock_on ||
         (((s->prnsts & SDHC_DATA_INHIBIT) || s->stopped_state) &&
         ((s->cmdreg & SDHC_CMD_DATA_PRESENT) ||
         ((s->cmdreg & SDHC_CMD_RESPONSE) == SDHC_CMD_RSP_WITH_BUSY &&
@@ -1779,6 +1786,9 @@ static void sdhci_bus_class_init(ObjectClass *klass, const void *data)
 
 #define ESDHC_VENDOR_SPEC               0xc0
 #define ESDHC_FRC_SDCLK_ON              (1 << 8)
+#define ESDHC_VENDORSPEC_IPGEN          BIT(11)
+#define ESDHC_VENDORSPEC_HCKEN          BIT(12)
+#define ESDHC_VENDORSPEC_CKEN           BIT(14)
 
 #define ESDHC_DLL_CTRL                  0x60
 
@@ -1872,6 +1882,21 @@ esdhc_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
             s->prnsts &= ~ESDHC_PRNSTS_CLOCK_GATE_OFF;
         } else {
             s->prnsts |= ESDHC_PRNSTS_CLOCK_GATE_OFF;
+        }
+        if (s->quirks & SDHCI_QUIRK_IMX95_CLOCK) {
+            /*
+             * U-Boot enables the uSDHC clocks through VENDORSPEC;
+             * Linux also uses SYSCTL. Reflect the vendor enables into
+             * the common clock state without changing other machines.
+             */
+            if (value & (ESDHC_VENDORSPEC_HCKEN | ESDHC_VENDORSPEC_IPGEN)) {
+                s->clkcon |= SDHC_CLOCK_INT_EN | SDHC_CLOCK_INT_STABLE;
+            }
+            if (value & ESDHC_VENDORSPEC_CKEN) {
+                s->clkcon |= SDHC_CLOCK_SDCLK_EN;
+            } else {
+                s->clkcon &= ~SDHC_CLOCK_SDCLK_EN;
+            }
         }
         break;
 

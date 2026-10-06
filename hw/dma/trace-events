@@ -1,5 +1,11 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# imx95_edma.c (optional, local functional routing diagnostics)
+imx95_edma_request(int input, int channel, uint32_t source) "input=%d channel=%d source=%u"
+imx95_edma_minor(void *edma, int channel, uint64_t src, uint64_t dst, uint32_t nbytes, uint16_t citer, uint16_t biter) "edma=%p channel=%d src=0x%"PRIx64" dst=0x%"PRIx64" nbytes=%u citer=%u biter=%u"
+imx95_edma_cyclic_read(void *edma, int channel, uint64_t offset, uint64_t value, unsigned size) "edma=%p channel=%d offset=0x%"PRIx64" value=0x%"PRIx64" size=%u"
+imx95_edma_trigger(int channel, uint32_t source, uint32_t sbr, uint64_t src, uint64_t dst, uint32_t nbytes, uint16_t csr) "channel=%d source=%u sbr=0x%x src=0x%"PRIx64" dst=0x%"PRIx64" nbytes=%u csr=0x%x"
+
 # rc4030.c
 jazzio_read(uint64_t addr, uint32_t ret) "read reg[0x%"PRIx64"] = 0x%x"
 jazzio_write(uint64_t addr, uint32_t val) "write reg[0x%"PRIx64"] = 0x%x"

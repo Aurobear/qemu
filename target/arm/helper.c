@@ -3178,6 +3178,10 @@ static uint64_t mpidr_read_val(CPUARMState *env)
     ARMCPU *cpu = env_archcpu(env);
     uint64_t mpidr = cpu->mp_affinity;
 
+    if (cpu->mpidr_mt) {
+        mpidr |= (1U << 24);
+    }
+
     if (arm_feature(env, ARM_FEATURE_V7MP)) {
         mpidr |= (1U << 31);
         /*

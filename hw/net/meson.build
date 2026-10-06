@@ -71,3 +71,5 @@ if have_hmp
 endif
 
 subdir('can')
+
+system_ss.add(when: 'CONFIG_FSL_ENETC', if_true: files('fsl_enetc.c', 'imx95_netc_emdio.c', 'imx95_netc_timer.c'))

@@ -75,6 +75,30 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files(
   'imx_ccm.c',
   'imx_rngc.c',
 ))
+system_ss.add(when: 'CONFIG_IMX_MU', if_true: files('imx_mu.c'))
+system_ss.add(when: 'CONFIG_IMX95_WDOG', if_true: files('imx95_wdog.c'))
+system_ss.add(when: 'CONFIG_IMX95_DDR_PMU', if_true: files('imx95_ddr_pmu.c'))
+system_ss.add(when: 'CONFIG_IMX95_CCM', if_true: files('imx95_ccm.c'))
+system_ss.add(when: 'CONFIG_IMX95_XCACHE', if_true: files('imx95_xcache.c'))
+system_ss.add(when: 'CONFIG_IMX95_PMIC', if_true: files('imx95_pmic.c'))
+system_ss.add(when: 'CONFIG_IMX95_GPC', if_true: files('imx95_gpc.c'))
+system_ss.add(when: 'CONFIG_IMX95_SRC', if_true: files('imx95_src.c'))
+system_ss.add(when: 'CONFIG_IMX95_AONMIX', if_true: files('imx95_aonmix.c'))
+system_ss.add(when: 'CONFIG_IMX95_ANATOP', if_true: files('imx95_anatop.c'))
+system_ss.add(when: 'CONFIG_FSL_IMX95', if_true: files('dma-account.c'))
+system_ss.add(when: 'CONFIG_IMX95_DPU', if_true: files('imx95_dpu.c'))
+system_ss.add(when: 'CONFIG_IMX95_NEUTRON', if_true: files(
+  'imx95_neutron.c',
+  'imx95_neutron_backend_null.c'))
+system_ss.add(when: 'CONFIG_IMX95_NEUTRON',
+  if_true: files('imx95_neutron_backend_runner_stub.c'))
+specific_ss.add(when: 'CONFIG_IMX95_MALI', if_true: files('imx95_mali.c'))
+system_ss.add(when: 'CONFIG_IMX_TPM_PWM', if_true: files('imx_tpm_pwm.c'))
+system_ss.add(when: 'CONFIG_IMX93_ADC', if_true: files('imx93_adc.c'))
+system_ss.add(when: 'CONFIG_IMX95_JPEG',
+              if_true: jpeg.found() ? [files('imx95_jpeg.c'), jpeg]
+                                    : files('imx95_jpeg.c'))
+system_ss.add(when: 'CONFIG_IMX95_ELE_SERVER', if_true: files('imx95_ele_server.c'))
 system_ss.add(when: 'CONFIG_MAX78000_AES', if_true: files('max78000_aes.c'))
 system_ss.add(when: 'CONFIG_MAX78000_GCR', if_true: files('max78000_gcr.c'))
 system_ss.add(when: 'CONFIG_MAX78000_ICC', if_true: files('max78000_icc.c'))
@@ -177,3 +201,6 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
+
+# Polling TMPSNS model used only by the local i.MX95 machine.
+system_ss.add(when: 'CONFIG_IMX95_ANATOP', if_true: files('imx95_tmpsns.c'))

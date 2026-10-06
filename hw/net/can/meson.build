@@ -7,3 +7,5 @@ system_ss.add(when: 'CONFIG_CAN_CTUCANFD_PCI', if_true: files('ctucan_pci.c'))
 system_ss.add(when: 'CONFIG_XLNX_ZYNQMP', if_true: files('xlnx-zynqmp-can.c'))
 system_ss.add(when: 'CONFIG_XLNX_VERSAL', if_true: files('xlnx-versal-canfd.c'))
 system_ss.add(when: 'CONFIG_CAN_FLEXCAN', if_true: files('flexcan.c'))
+
+system_ss.add(when: 'CONFIG_IMX95_FLEXCAN', if_true: files('imx95-flexcan.c'))

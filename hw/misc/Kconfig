@@ -101,6 +101,52 @@ config FSL_IMX8MP_ANALOG
 config FSL_IMX8MP_CCM
     bool
 
+config IMX_MU
+    bool
+
+
+config IMX95_WDOG
+    bool
+
+config IMX95_DDR_PMU
+    bool
+
+config IMX95_CCM
+    bool
+
+config IMX95_XCACHE
+    bool
+
+config IMX95_PMIC
+    bool
+    select I2C
+
+config IMX95_GPC
+    bool
+
+config IMX95_SRC
+    bool
+
+config IMX95_AONMIX
+    bool
+
+config IMX95_ANATOP
+    bool
+
+config IMX95_DPU
+    bool
+    select FRAMEBUFFER
+
+config IMX95_NEUTRON
+    bool
+
+config IMX95_MALI
+    bool
+
+config IMX95_ELE_SERVER
+    bool
+    select IMX_MU
+
 config STM32_RCC
     bool
 
@@ -264,3 +310,12 @@ config K230_DECOMP_GZIP
     bool
 
 source macio/Kconfig
+
+config IMX95_JPEG
+    bool
+
+config IMX_TPM_PWM
+    bool
+
+config IMX93_ADC
+    bool

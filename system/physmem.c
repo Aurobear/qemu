@@ -683,7 +683,8 @@ void tcg_iommu_init_notifier_list(CPUState *cpu)
 MemoryRegionSection *
 address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr orig_addr,
                                   hwaddr *xlat, hwaddr *plen,
-                                  MemTxAttrs attrs, int *prot)
+                                  MemTxAttrs attrs, int *prot,
+                                  IOMMUAccessFlags access, hwaddr access_offset)
 {
     MemoryRegionSection *section;
     IOMMUMemoryRegion *iommu_mr;
@@ -709,6 +710,20 @@ address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr orig_addr,
          * doesn't short-cut its translation table walk.
          */
         iotlb = imrc->translate(iommu_mr, addr, IOMMU_NONE, iommu_idx);
+        if (imrc->tcg_access_check && access && !(iotlb.perm & access)) {
+            /* Report the actual access to the device, including its fault IRQ.
+             * Use an unassigned section for this access only, so the CPU takes
+             * its normal external-abort path rather than accessing host RAM.
+             * Other access types must miss and re-evaluate their permissions.
+             */
+            imrc->translate(iommu_mr, addr + access_offset, access, iommu_idx);
+            *prot = access == IOMMU_EXEC ? PAGE_EXEC :
+                    access == IOMMU_WO ? PAGE_WRITE : PAGE_READ;
+            goto translate_fail;
+        }
+        if (imrc->tcg_access_check && !(iotlb.perm & IOMMU_EXEC)) {
+            *prot &= ~PAGE_EXEC;
+        }
         addr = ((iotlb.translated_addr & ~iotlb.addr_mask)
                 | (addr & iotlb.addr_mask));
         /* Update the caller's prot bits to remove permissions the IOMMU

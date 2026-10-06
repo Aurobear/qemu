@@ -395,6 +395,11 @@ struct IOMMUMemoryRegionClass {
     MemoryRegionClass parent_class;
 
     /* public: */
+    /* Local opt-in for CPU-facing IOMMUs that implement execute permissions.
+     * Legacy DMA IOMMUs retain their existing read-implies-execute behavior.
+     */
+    bool tcg_access_check;
+
     /**
      * @translate:
      *

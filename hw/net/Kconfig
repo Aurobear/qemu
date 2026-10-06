@@ -162,3 +162,11 @@ config CAN_FLEXCAN
     bool
     depends on IMX
     select CAN_BUS
+
+config IMX95_FLEXCAN
+    bool
+    select CAN_BUS
+
+config FSL_ENETC
+    bool
+    depends on PCI_EXPRESS && MSI_NONBROKEN

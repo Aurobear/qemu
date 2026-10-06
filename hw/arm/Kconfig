@@ -613,6 +613,60 @@ config FSL_IMX8MP_EVK
     depends on TCG
     select FSL_IMX8MP
 
+config FSL_IMX95
+    bool
+    select ARM_V7M
+    select FSL_ENETC
+    select IMX95_PCIE
+    select ARM_GIC
+    select ARM_GICV3
+    select IMX_LPUART
+    select IMX_MU
+    select IMX95_ELE_SERVER
+    select IMX95_WDOG
+    select IMX95_DDR_PMU
+    select IMX95_CCM
+    select SPI_LINK
+    select USB_DWC3
+    select IMX95_XCACHE
+    select IMX95_PMIC
+    select IMX95_GPC
+    select IMX95_SRC
+    select IMX95_AONMIX
+    select IMX95_ANATOP
+    select IMX95_DPU
+    select IMX95_NEUTRON
+    select IMX95_MALI
+    select IMX95_ISI
+    select IMX95_NEOISP
+    select IMX95_DSI
+    select IMX_IRQSTEER
+    select IMX95_GPIO
+    select IMX95_JPEG
+    select IMX_TPM_PWM
+    select IMX93_ADC
+    select IMX_FSPI
+    select IMX95_LPSPI
+    select IMX95_AUDIO
+    select IMX95_EDMA
+    select IMX95_SYSCTR
+    select IMX_LPI2C
+    select IMX95_FLEXCAN
+    select SDHCI
+    select PCI_EXPRESS_GENERIC_BRIDGE
+    select USB_CHIPIDEA
+    select SILVACO_I3C
+    select TMP105
+    select VIRTIO_MMIO
+    select UNIMP
+
+config FSL_IMX95_EVK
+    bool
+    default y
+    depends on AARCH64
+    depends on TCG
+    select FSL_IMX95
+
 config FSL_IMX8MM
     bool
     imply PCI_DEVICES
